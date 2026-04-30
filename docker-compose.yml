@@ -1,0 +1,198 @@
+version: '3.9'
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EduReach Platform – Docker Compose
+# Usage:
+#   Development:  docker-compose up
+#   Production:   docker-compose -f docker-compose.yml -f docker-compose.prod.yml up
+# ──────────────────────────────────────────────────────────────────────────────
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ── Frontend (Next.js) ───────────────────────────────────────────────────
+  frontend:
+    build:
+      context:    ./
+      dockerfile: Dockerfile.frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000/api/v1}
+    container_name: edureach-frontend
+    restart:    unless-stopped
+    ports:      ["3000:3000"]
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://api:4000/api/v1}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET}
+      - NEXTAUTH_URL=${NEXTAUTH_URL:-http://localhost:3000}
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:   [edureach-net]
+    logging:    *default-logging
+    healthcheck:
+      test:     ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+
+  # ── API (NestJS) ─────────────────────────────────────────────────────────
+  api:
+    build:
+      context:    ./backend
+      dockerfile: Dockerfile
+    container_name: edureach-api
+    restart:    unless-stopped
+    ports:      ["4000:4000"]
+    environment:
+      NODE_ENV:           ${NODE_ENV:-development}
+      PORT:               4000
+      DATABASE_URL:       postgresql://${DB_USER:-edureach}:${DB_PASSWORD:-password}@postgres:5432/${DB_NAME:-edureach}
+      REDIS_HOST:         redis
+      REDIS_PORT:         6379
+      JWT_SECRET:         ${JWT_SECRET:?JWT_SECRET is required}
+      JWT_EXPIRES_IN:     ${JWT_EXPIRES_IN:-15m}
+      REFRESH_TOKEN_TTL:  ${REFRESH_TOKEN_TTL:-30d}
+      CORS_ORIGIN:        ${CORS_ORIGIN:-http://localhost:3000}
+      STRIPE_SECRET_KEY:  ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      AWS_ACCESS_KEY_ID:  ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_KEY:     ${AWS_SECRET_KEY}
+      AWS_REGION:         ${AWS_REGION:-us-east-1}
+      AWS_S3_BUCKET:      ${AWS_S3_BUCKET:-edureach-uploads}
+      SMTP_HOST:          ${SMTP_HOST:-mailhog}
+      SMTP_PORT:          ${SMTP_PORT:-1025}
+      SMTP_USER:          ${SMTP_USER}
+      SMTP_PASS:          ${SMTP_PASS}
+      GOOGLE_CLIENT_ID:   ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GITHUB_CLIENT_ID:   ${GITHUB_CLIENT_ID}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET}
+      OPENAI_API_KEY:     ${OPENAI_API_KEY}
+      FRONTEND_URL:       ${FRONTEND_URL:-http://localhost:3000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:   [edureach-net]
+    logging:    *default-logging
+    healthcheck:
+      test:     ["CMD", "curl", "-f", "http://localhost:4000/api/v1/health"]
+      interval: 15s
+      timeout:  5s
+      retries:  5
+      start_period: 30s
+    volumes:
+      - api-uploads:/app/uploads
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  postgres:
+    image:    postgres:16-alpine
+    container_name: edureach-postgres
+    restart:  unless-stopped
+    environment:
+      POSTGRES_USER:     ${DB_USER:-edureach}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
+      POSTGRES_DB:       ${DB_NAME:-edureach}
+      PGDATA:            /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./backend/database/init:/docker-entrypoint-initdb.d:ro
+    ports:    ["5432:5432"]
+    networks: [edureach-net]
+    logging:  *default-logging
+    healthcheck:
+      test:     ["CMD-SHELL", "pg_isready -U ${DB_USER:-edureach} -d ${DB_NAME:-edureach}"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+    command: >
+      postgres
+        -c max_connections=200
+        -c shared_buffers=256MB
+        -c effective_cache_size=1GB
+        -c maintenance_work_mem=64MB
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=16MB
+        -c default_statistics_target=100
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image:    redis:7-alpine
+    container_name: edureach-redis
+    restart:  unless-stopped
+    command:  redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    ports:    ["6379:6379"]
+    networks: [edureach-net]
+    logging:  *default-logging
+    healthcheck:
+      test:     ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout:  3s
+      retries:  5
+
+  # ── Nginx Reverse Proxy ───────────────────────────────────────────────────
+  nginx:
+    image:   nginx:1.25-alpine
+    container_name: edureach-nginx
+    restart: unless-stopped
+    ports:   ["80:80", "443:443"]
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx-certs:/etc/nginx/certs
+      - nginx-logs:/var/log/nginx
+    depends_on: [frontend, api]
+    networks: [edureach-net]
+    logging: *default-logging
+
+  # ── MailHog (dev email) ───────────────────────────────────────────────────
+  mailhog:
+    image:    mailhog/mailhog:latest
+    container_name: edureach-mailhog
+    restart:  unless-stopped
+    ports:    ["8025:8025", "1025:1025"]
+    networks: [edureach-net]
+    profiles: [dev]
+
+  # ── Adminer (dev DB browser) ──────────────────────────────────────────────
+  adminer:
+    image:    adminer:4
+    container_name: edureach-adminer
+    restart:  unless-stopped
+    ports:    ["8080:8080"]
+    networks: [edureach-net]
+    profiles: [dev]
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+
+  # ── Redis Commander (dev) ─────────────────────────────────────────────────
+  redis-commander:
+    image:    rediscommander/redis-commander:latest
+    container_name: edureach-redis-ui
+    restart:  unless-stopped
+    ports:    ["8081:8081"]
+    networks: [edureach-net]
+    profiles: [dev]
+    environment:
+      REDIS_HOSTS: local:redis:6379
+
+# ──────────────────────────────────────────────────────────────────────────────
+networks:
+  edureach-net:
+    driver: bridge
+    name:   edureach-network
+
+volumes:
+  postgres-data:  { name: edureach-postgres-data }
+  redis-data:     { name: edureach-redis-data }
+  api-uploads:    { name: edureach-uploads }
+  nginx-certs:    { name: edureach-nginx-certs }
+  nginx-logs:     { name: edureach-nginx-logs }

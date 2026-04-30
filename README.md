@@ -1,0 +1,2 @@
+# edureach-platform
+NPO ORGANIZATION FULL CODE / FRONT - BACK I CODES
